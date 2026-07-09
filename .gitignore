@@ -1,0 +1,14 @@
+# Credentials and runtime artifacts — never commit these
+*.json.tmp
+*.json.bak
+rh-mcp-creds.json
+rh-mcp-creds.lock
+rh-mcp.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS
+.DS_Store
