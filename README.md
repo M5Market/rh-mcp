@@ -1,4 +1,8 @@
-# rh-mcp
+<p align="center">
+  <img src="logo.png" alt="rh-mcp logo" width="180">
+</p>
+
+<h1 align="center">rh-mcp</h1>
 
 Robinhood MCP proxy with integrated OAuth — a single-file, zero-dependency
 bridge that lets any MCP client (ZCode, Claude Code, Cursor, etc.) talk to
