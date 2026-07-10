@@ -47,14 +47,12 @@ from pathlib import Path
 __version__ = "1.0.0"
 
 # ==========================================================================
-# Constants — discovered from Robinhood's OAuth metadata endpoints.
+# Constants — only the upstream URL is hardcoded (it's the server address,
+# like a config input). Everything else (client_id, endpoints, scopes) is
+# discovered at runtime via the standard MCP OAuth 2.1 discovery chain.
 # ==========================================================================
 
-CLIENT_ID = "LtLiNmbs9owbYfWgBlC68Z2VujIPuvGoAiSYr8xW"
-AUTH_ENDPOINT = "https://robinhood.com/oauth"
-TOKEN_ENDPOINT = "https://api.robinhood.com/oauth2/token/"
 UPSTREAM_URL = "https://agent.robinhood.com/mcp/trading"
-SCOPES = "internal"
 
 REDIRECT_HOST = "localhost"
 REDIRECT_PORT = 8765
@@ -143,6 +141,114 @@ def http_post_json(url, data, headers=None, timeout=DEFAULT_TIMEOUT_S):
         raise RuntimeError(f"non-JSON response from {url}: {raw!r}") from None
 
 
+def http_get_json(url, headers=None, timeout=DEFAULT_TIMEOUT_S):
+    """GET JSON. Raise RuntimeError on non-2xx/parse error."""
+    h = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        raise RuntimeError(f"HTTP {e.code} from {url}: {raw}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"network error to {url}: {e.reason}") from e
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"non-JSON response from {url}: {raw!r}") from None
+
+
+# ==========================================================================
+# OAuth discovery — the MCP spec's 401 → metadata → authorization-server
+# → DCR chain. Only UPSTREAM_URL is hardcoded; everything else is resolved
+# here so the tool self-corrects if Robinhood rotates any values.
+# ==========================================================================
+
+_discovered = None  # process-level cache
+
+
+def _well_known_url(auth_server: str) -> str:
+    """Build the RFC 8414 metadata URL for an authorization server.
+
+    The metadata lives at the HOST root (.well-known/oauth-authorization-server),
+    not naively appended to the auth-server path. Some servers (Robinhood
+    included) publish metadata at the host root while the auth-server URL
+    points at a subpath, so we resolve against the origin.
+    """
+    parsed = urllib.parse.urlparse(auth_server)
+    return f"{parsed.scheme}://{parsed.netloc}/.well-known/oauth-authorization-server"
+
+
+def discover_oauth_config(force: bool = False) -> dict:
+    """Discover client_id, endpoints, and scopes via the MCP OAuth 2.1 chain.
+
+    Chain: UPSTREAM_URL 401 → www-authenticate → protected-resource metadata
+    → authorization_servers → RFC 8414 metadata → DCR → client_id.
+
+    Returns a dict with keys: client_id, authorization_endpoint,
+    token_endpoint, scopes, issuer. Cached per-process.
+    """
+    global _discovered
+    if _discovered is not None and not force:
+        return _discovered
+
+    # Step 1: probe the upstream to get the www-authenticate challenge.
+    req = urllib.request.Request(
+        UPSTREAM_URL, data=b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT}, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S)
+        raise RuntimeError("upstream did not return 401 during discovery")
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise RuntimeError(f"upstream returned {e.code}, expected 401 for discovery")
+        www_auth = e.headers.get("www-authenticate", "")
+
+    # Step 2: resolve the protected-resource metadata URL from the challenge.
+    m = re.search(r'resource_metadata="([^"]+)"', www_auth)
+    if not m:
+        raise RuntimeError(f"no resource_metadata in www-authenticate: {www_auth!r}")
+    resource_meta_url = m.group(1)
+
+    # Step 3: fetch protected-resource metadata → authorization_servers.
+    resource_meta = http_get_json(resource_meta_url)
+    auth_servers = resource_meta.get("authorization_servers", [])
+    if not auth_servers:
+        raise RuntimeError(f"no authorization_servers in resource metadata: {resource_meta}")
+    auth_server = auth_servers[0]
+    scopes = resource_meta.get("scopes_supported", ["internal"])
+
+    # Step 4: fetch RFC 8414 authorization-server metadata.
+    as_meta = http_get_json(_well_known_url(auth_server))
+    cfg = {
+        "client_id": None,  # resolved by DCR below
+        "authorization_endpoint": as_meta.get("authorization_endpoint"),
+        "token_endpoint": as_meta.get("token_endpoint"),
+        "registration_endpoint": as_meta.get("registration_endpoint"),
+        "scopes": scopes[0] if isinstance(scopes, list) else scopes,
+        "issuer": as_meta.get("issuer", auth_server),
+    }
+    if not (cfg["authorization_endpoint"] and cfg["token_endpoint"]):
+        raise RuntimeError(f"incomplete authorization-server metadata: {as_meta}")
+
+    # Step 5: dynamic client registration to obtain the client_id.
+    # Robinhood returns a single fixed public client_id regardless of input,
+    # but we call the standard DCR endpoint rather than hardcoding the value.
+    if cfg["registration_endpoint"]:
+        dcr = http_post_json(cfg["registration_endpoint"], {})
+        cfg["client_id"] = dcr.get("client_id")
+    if not cfg["client_id"]:
+        raise RuntimeError("could not obtain client_id via dynamic registration")
+
+    _discovered = cfg
+    log(f"oauth discovered: client_id={cfg['client_id'][:8]}... "
+        f"auth={cfg['authorization_endpoint']} token={cfg['token_endpoint']}")
+    return cfg
+
+
 # ==========================================================================
 # Token store — single source of truth, written atomically.
 # ==========================================================================
@@ -213,7 +319,7 @@ def build_creds(token_resp: dict) -> dict:
         "access_token_expires_at": int(now + expires_in),
         "expires_in": expires_in,
         "token_type": token_resp.get("token_type", "Bearer"),
-        "scope": token_resp.get("scope", SCOPES),
+        "scope": token_resp.get("scope", "internal"),
     }
 
 
@@ -228,11 +334,12 @@ def refresh_token() -> dict:
         rt = creds.get("refresh_token")
         if not rt:
             raise RuntimeError("no refresh_token stored — run 'rh-mcp login'")
+        oauth = discover_oauth_config()
         log("refreshing access token")
-        token_resp = http_post_json(TOKEN_ENDPOINT, {
+        token_resp = http_post_json(oauth["token_endpoint"], {
             "grant_type": "refresh_token",
             "refresh_token": rt,
-            "client_id": CLIENT_ID,
+            "client_id": oauth["client_id"],
         })
         new_creds = build_creds(token_resp)
         # Robinhood may rotate the refresh_token; keep whichever is current.
@@ -309,14 +416,15 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
 def run_login():
     """Interactive browser PKCE flow. Stores tokens on success."""
     with CredLock():
+        oauth = discover_oauth_config()
         verifier, challenge = gen_pkce()
         state = secrets.token_urlsafe(16)
         params = {
-            "response_type": "code", "client_id": CLIENT_ID,
-            "redirect_uri": REDIRECT_URI, "scope": SCOPES, "state": state,
+            "response_type": "code", "client_id": oauth["client_id"],
+            "redirect_uri": REDIRECT_URI, "scope": oauth["scopes"], "state": state,
             "code_challenge": challenge, "code_challenge_method": "S256",
         }
-        auth_url = AUTH_ENDPOINT + "?" + urllib.parse.urlencode(params)
+        auth_url = oauth["authorization_endpoint"] + "?" + urllib.parse.urlencode(params)
 
         cb_state = _CBState()
         cb_state.expected_state = state
@@ -349,9 +457,9 @@ def run_login():
             die("timed out waiting for browser callback (5 min). Re-run 'login'.")
 
         print("Authorization code received. Exchanging for tokens...")
-        token_resp = http_post_json(TOKEN_ENDPOINT, {
+        token_resp = http_post_json(oauth["token_endpoint"], {
             "grant_type": "authorization_code", "code": cb_state.code,
-            "redirect_uri": REDIRECT_URI, "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI, "client_id": oauth["client_id"],
             "code_verifier": verifier,
         })
         creds = build_creds(token_resp)
