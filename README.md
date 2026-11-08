@@ -105,6 +105,24 @@ Add to Settings → MCP:
 After editing the config, restart your client. The `robinhood` server should
 show as **connected**.
 
+## Other MCP servers
+
+The OAuth flow is the standard MCP one, so the proxy works for any OAuth-protected MCP
+server whose client does not sign in by itself. Give it the server's URL and a name; the
+name keeps that server's credentials (`~/.zcode/<name>-creds.json`), lock and log apart
+from Robinhood's, and is the server's key in client configs:
+
+```bash
+./rh-mcp --upstream https://data.example.net/mcp --name example login
+```
+
+```json
+"example": {"type": "stdio", "command": "/absolute/path/to/rh-mcp",
+            "args": ["--upstream", "https://data.example.net/mcp", "--name", "example", "serve"]}
+```
+
+Without the two flags everything is Robinhood's, as above.
+
 ## Commands
 
 | Command | Description |
