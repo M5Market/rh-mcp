@@ -130,5 +130,54 @@ class Proxy401LogicTest(unittest.TestCase):
         self.assertIn("JWT", e.body)
 
 
+class UpstreamOptionTest(unittest.TestCase):
+    """--upstream / --name point the proxy at another server under its own credentials."""
+
+    def setUp(self):
+        self.saved = {k: getattr(rh, k) for k in ("UPSTREAM_URL", "NAME", "SERVER_KEY", "CREDS_PATH", "LOCK_PATH", "LOG_PATH")}
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(rh, k, v)
+
+    def test_defaults_unchanged(self):
+        rh.configure(None, None)
+        self.assertEqual(rh.UPSTREAM_URL, "https://agent.robinhood.com/mcp/trading")
+        self.assertEqual(rh.CREDS_PATH.name, "rh-mcp-creds.json")
+        self.assertEqual(rh.LOCK_PATH.name, "rh-mcp-creds.lock")
+        self.assertEqual(rh.LOG_PATH.name, "rh-mcp.log")
+        self.assertEqual(rh.serve_args(), ["serve"])
+
+    def test_named_server_gets_its_own_files_and_key(self):
+        rh.configure("https://data.example.net/mcp", "example")
+        self.assertEqual(rh.UPSTREAM_URL, "https://data.example.net/mcp")
+        self.assertEqual(rh.CREDS_PATH.name, "example-creds.json")
+        self.assertEqual(rh.LOCK_PATH.name, "example-creds.lock")
+        self.assertEqual(rh.LOG_PATH.name, "example.log")
+        self.assertEqual(rh.SERVER_KEY, "example")
+        self.assertEqual(rh.serve_args(), ["--upstream", "https://data.example.net/mcp", "--name", "example", "serve"])
+        self.assertEqual(rh.CredLock().path.name, "example-creds.lock")
+
+    def test_upstream_without_name_is_refused(self):
+        with self.assertRaises(SystemExit):
+            rh.configure("https://data.example.net/mcp", None)
+
+    def test_bad_values_are_refused(self):
+        for up, name in (("http://data.example.net/mcp", "example"), ("https://data.example.net/mcp", "../x"), ("https://data.example.net/mcp", "-x")):
+            with self.assertRaises(SystemExit):
+                rh.configure(up, name)
+
+    def test_wiring_uses_the_name_and_flags(self):
+        rh.configure("https://data.example.net/mcp", "example")
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            cfg.write_text(json.dumps({"mcp": {"servers": {"robinhood": {"type": "stdio", "command": "x", "args": ["serve"]}}}}))
+            ok, _ = rh.wire_stdio_config("zcode", cfg, ["mcp", "servers"])
+            servers = json.loads(cfg.read_text())["mcp"]["servers"]
+            self.assertTrue(ok)
+            self.assertEqual(servers["robinhood"]["args"], ["serve"])  # the Robinhood entry is left alone
+            self.assertEqual(servers["example"]["args"], ["--upstream", "https://data.example.net/mcp", "--name", "example", "serve"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

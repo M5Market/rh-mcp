@@ -53,6 +53,8 @@ __version__ = "1.0.0"
 # ==========================================================================
 
 UPSTREAM_URL = "https://agent.robinhood.com/mcp/trading"
+NAME = "rh-mcp"            # names the credentials, lock and log files
+SERVER_KEY = "robinhood"   # the server's key in client configs
 
 REDIRECT_HOST = "localhost"
 REDIRECT_PORT = 8765
@@ -72,6 +74,30 @@ ZCODE_CONFIG_PATH = Path.home() / ".zcode" / "cli" / "config.json"
 CLAUDE_CONFIG_PATH = Path.home() / ".claude.json"
 
 USER_AGENT = f"rh-mcp/{__version__} (Robinhood MCP bridge)"
+
+
+def configure(upstream=None, name=None):
+    """Point the proxy at another OAuth-protected MCP server (--upstream) under its own
+    credentials (--name). With neither, everything stays as above (Robinhood)."""
+    global UPSTREAM_URL, NAME, SERVER_KEY, CREDS_PATH, LOCK_PATH, LOG_PATH
+    if upstream:
+        if not upstream.startswith("https://"):
+            die(f"--upstream must be an https:// URL, got {upstream!r}")
+        UPSTREAM_URL = upstream
+    if name:
+        if not all(c.isalnum() or c == "-" for c in name) or name.startswith("-"):
+            die(f"--name may hold letters, digits and hyphens only, got {name!r}")
+        NAME, SERVER_KEY = name, name
+    elif upstream:
+        die("--upstream needs --name, so its credentials never share Robinhood's file")
+    CREDS_PATH = Path.home() / ".zcode" / f"{NAME}-creds.json"
+    LOCK_PATH = Path.home() / ".zcode" / f"{NAME}-creds.lock"
+    LOG_PATH = Path.home() / ".zcode" / f"{NAME}.log"
+
+
+def serve_args() -> list:
+    """The args a client config passes to run this proxy for the configured server."""
+    return ["serve"] if SERVER_KEY == "robinhood" else ["--upstream", UPSTREAM_URL, "--name", NAME, "serve"]
 
 # ==========================================================================
 # Logging — stderr only. stdout is reserved for the MCP protocol when serving.
@@ -119,10 +145,15 @@ def pkce_challenge_for(verifier: str) -> str:
     return b64url(hashlib.sha256(verifier.encode("ascii")).digest())
 
 
-def http_post_json(url, data, headers=None, timeout=DEFAULT_TIMEOUT_S):
-    """POST JSON, return parsed JSON. Raise RuntimeError on non-2xx/parse error."""
-    body = json.dumps(data).encode("utf-8")
-    h = {"Content-Type": "application/json", "Accept": "application/json",
+def http_post_json(url, data, headers=None, timeout=DEFAULT_TIMEOUT_S, form=None):
+    """POST JSON (or a form, with form=), return parsed JSON. Raise RuntimeError on non-2xx/parse error."""
+    if form is not None:
+        body = urllib.parse.urlencode(form).encode("utf-8")
+        ctype = "application/x-www-form-urlencoded"
+    else:
+        body = json.dumps(data).encode("utf-8")
+        ctype = "application/json"
+    h = {"Content-Type": ctype, "Accept": "application/json",
          "User-Agent": USER_AGENT}
     if headers:
         h.update(headers)
@@ -139,6 +170,11 @@ def http_post_json(url, data, headers=None, timeout=DEFAULT_TIMEOUT_S):
         return json.loads(raw)
     except json.JSONDecodeError:
         raise RuntimeError(f"non-JSON response from {url}: {raw!r}") from None
+
+
+def http_post_form(url, data, timeout=DEFAULT_TIMEOUT_S):
+    """POST an OAuth token request form-encoded (RFC 6749 §4.1.3, §6), return parsed JSON."""
+    return http_post_json(url, None, timeout=timeout, form=data)
 
 
 def http_get_json(url, headers=None, timeout=DEFAULT_TIMEOUT_S):
@@ -197,21 +233,29 @@ def discover_oauth_config(force: bool = False) -> dict:
 
     # Step 1: probe the upstream to get the www-authenticate challenge.
     req = urllib.request.Request(
-        UPSTREAM_URL, data=b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
-        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT}, method="POST")
+        UPSTREAM_URL, data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+            "clientInfo": {"name": "rh-mcp", "version": __version__}}}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                 "User-Agent": USER_AGENT}, method="POST")
+    www_auth = ""
     try:
-        urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S)
-        raise RuntimeError("upstream did not return 401 during discovery")
+        urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S).close()
     except urllib.error.HTTPError as e:
         if e.code != 401:
-            raise RuntimeError(f"upstream returned {e.code}, expected 401 for discovery")
+            raise RuntimeError(f"upstream returned {e.code}, expected 401 or 200 for discovery")
         www_auth = e.headers.get("www-authenticate", "")
 
-    # Step 2: resolve the protected-resource metadata URL from the challenge.
+    # Step 2: the protected-resource metadata URL — from the challenge, or, for a server
+    # that answers without sign-in, at its RFC 9728 well-known location.
     m = re.search(r'resource_metadata="([^"]+)"', www_auth)
-    if not m:
+    if m:
+        resource_meta_url = m.group(1)
+    elif www_auth:
         raise RuntimeError(f"no resource_metadata in www-authenticate: {www_auth!r}")
-    resource_meta_url = m.group(1)
+    else:
+        u = urllib.parse.urlparse(UPSTREAM_URL)
+        resource_meta_url = f"{u.scheme}://{u.netloc}/.well-known/oauth-protected-resource{u.path.rstrip('/')}"
 
     # Step 3: fetch protected-resource metadata → authorization_servers.
     resource_meta = http_get_json(resource_meta_url)
@@ -219,10 +263,9 @@ def discover_oauth_config(force: bool = False) -> dict:
     if not auth_servers:
         raise RuntimeError(f"no authorization_servers in resource metadata: {resource_meta}")
     auth_server = auth_servers[0]
-    scopes = resource_meta.get("scopes_supported", ["internal"])
-
     # Step 4: fetch RFC 8414 authorization-server metadata.
     as_meta = http_get_json(_well_known_url(auth_server))
+    scopes = resource_meta.get("scopes_supported") or as_meta.get("scopes_supported") or ["internal"]
     cfg = {
         "client_id": None,  # resolved by DCR below
         "authorization_endpoint": as_meta.get("authorization_endpoint"),
@@ -238,7 +281,11 @@ def discover_oauth_config(force: bool = False) -> dict:
     # Robinhood returns a single fixed public client_id regardless of input,
     # but we call the standard DCR endpoint rather than hardcoding the value.
     if cfg["registration_endpoint"]:
-        dcr = http_post_json(cfg["registration_endpoint"], {})
+        dcr = http_post_json(cfg["registration_endpoint"], {
+            "client_name": "rh-mcp", "redirect_uris": [REDIRECT_URI],
+            "grant_types": ["authorization_code", "refresh_token"], "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        })
         cfg["client_id"] = dcr.get("client_id")
     if not cfg["client_id"]:
         raise RuntimeError("could not obtain client_id via dynamic registration")
@@ -256,8 +303,8 @@ def discover_oauth_config(force: bool = False) -> dict:
 class CredLock:
     """File lock around the credentials file to prevent concurrent clobbering."""
 
-    def __init__(self, path: Path = LOCK_PATH):
-        self.path = path
+    def __init__(self, path: Path = None):
+        self.path = path or LOCK_PATH
         self._fd = None
 
     def __enter__(self):
@@ -336,12 +383,15 @@ def refresh_token() -> dict:
             raise RuntimeError("no refresh_token stored — run 'rh-mcp login'")
         oauth = discover_oauth_config()
         log("refreshing access token")
-        token_resp = http_post_json(oauth["token_endpoint"], {
+        token_resp = http_post_form(oauth["token_endpoint"], {
             "grant_type": "refresh_token",
             "refresh_token": rt,
-            "client_id": oauth["client_id"],
+            # the client the tokens were issued to; a server that registers a new client
+            # per call (unlike Robinhood's fixed one) would refuse any other
+            "client_id": creds.get("client_id") or oauth["client_id"],
         })
         new_creds = build_creds(token_resp)
+        new_creds["client_id"] = creds.get("client_id") or oauth["client_id"]
         # Robinhood may rotate the refresh_token; keep whichever is current.
         new_creds["refresh_token"] = token_resp.get("refresh_token", rt)
         save_creds(new_creds)
@@ -457,12 +507,13 @@ def run_login():
             die("timed out waiting for browser callback (5 min). Re-run 'login'.")
 
         print("Authorization code received. Exchanging for tokens...")
-        token_resp = http_post_json(oauth["token_endpoint"], {
+        token_resp = http_post_form(oauth["token_endpoint"], {
             "grant_type": "authorization_code", "code": cb_state.code,
             "redirect_uri": REDIRECT_URI, "client_id": oauth["client_id"],
             "code_verifier": verifier,
         })
         creds = build_creds(token_resp)
+        creds["client_id"] = oauth["client_id"]
         save_creds(creds)
         print(f"Tokens saved to {CREDS_PATH}")
         print(f"  expires: {fmt_exp(creds)}")
@@ -722,13 +773,13 @@ def wire_stdio_config(client: str, config_path: Path, server_key_path: list):
         node = node.setdefault(key, {})
     servers = node.setdefault(server_key_path[-1], {})
 
-    servers["robinhood"] = {
+    servers[SERVER_KEY] = {
         "type": "stdio",
         "command": str(SELF_PATH),
-        "args": ["serve"],
+        "args": serve_args(),
     }
     _atomic_write_json(config_path, cfg)
-    return True, f"wired robinhood stdio proxy into {config_path}"
+    return True, f"wired {SERVER_KEY} stdio proxy into {config_path}"
 
 
 # ==========================================================================
@@ -767,7 +818,7 @@ def cmd_status(args):
                 node = cfg
                 for k in keys:
                     node = node.get(k, {}) if isinstance(node, dict) else {}
-                rh = node.get("robinhood") if isinstance(node, dict) else None
+                rh = node.get(SERVER_KEY) if isinstance(node, dict) else None
             except Exception:
                 pass
         wired = bool(rh) and rh.get("command", "").endswith("rh-mcp")
@@ -853,6 +904,8 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Run 'rh-mcp login' once, then point your MCP client at this "
                "script with 'serve'. See README for client config snippets.")
+    parser.add_argument("--upstream", help="another OAuth-protected MCP server's URL (default: Robinhood's)")
+    parser.add_argument("--name", help="a name for that server's credentials and client-config key (needed with --upstream)")
     sub = parser.add_subparsers(dest="cmd")
 
     p_serve = sub.add_parser("serve", help="run the stdio proxy (default)")
@@ -870,6 +923,7 @@ def main(argv=None):
     p_test.set_defaults(func=cmd_self_test)
 
     args = parser.parse_args(argv)
+    configure(args.upstream, args.name)
     if not getattr(args, "func", None):
         # Default to serve (so MCP clients can invoke with no subcommand).
         Proxy().run()
